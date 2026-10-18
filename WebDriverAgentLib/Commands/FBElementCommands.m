@@ -25,6 +25,21 @@
 #import "NSPredicate+FBFormat.h"
 #import "XCTestPrivateSymbols.h"
 #import "XCUIApplication+FBTouchAction.h"
+
+// XCTest's own touch types. XCUIAutomation is already linked into this target, so these
+// resolve at runtime; declaring them here rather than importing keeps the dependency
+// visible: a rename in a future Xcode breaks this build instead of silently misbehaving.
+@interface XCPointerEventPath : NSObject
+- (instancetype)initForTouchAtPoint:(CGPoint)point offset:(double)offset;
+- (void)moveToPoint:(CGPoint)point atOffset:(double)offset;
+- (void)liftUpAtOffset:(double)offset;
+@end
+
+@interface XCSynthesizedEventRecord : NSObject
+- (instancetype)initWithName:(NSString *)name interfaceOrientation:(int64_t)orientation;
+- (void)addPointerEventPath:(XCPointerEventPath *)path;
+- (BOOL)synthesizeWithError:(NSError **)error;
+@end
 #import "XCUICoordinate.h"
 #import "XCUIDevice.h"
 #import "XCUIElement+FBIsVisible.h"
@@ -108,6 +123,7 @@
 
     [[FBRoute POST:@"/wda/element/:uuid/dragfromtoforduration"] respondWithTarget:self action:@selector(handleDrag:)],
     [[FBRoute POST:@"/wda/dragfromtoforduration"] respondWithTarget:self action:@selector(handleDrag:)],
+    [[FBRoute POST:@"/wda/fastDrag"] respondWithTarget:self action:@selector(handleFastDrag:)],
 
     [[FBRoute POST:@"/wda/element/:uuid/pressAndDragWithVelocity"] respondWithTarget:self action:@selector(handlePressAndDragWithVelocity:)],
     [[FBRoute POST:@"/wda/pressAndDragWithVelocity"] respondWithTarget:self action:@selector(handlePressAndDragCoordinateWithVelocity:)],
@@ -117,6 +133,7 @@
 
     [[FBRoute POST:@"/wda/element/:uuid/tap"] respondWithTarget:self action:@selector(handleTap:)],
     [[FBRoute POST:@"/wda/tap"] respondWithTarget:self action:@selector(handleTap:)],
+    [[FBRoute POST:@"/wda/fastTap"] respondWithTarget:self action:@selector(handleFastTap:)],
 
     [[FBRoute POST:@"/wda/pickerwheel/:uuid/select"] respondWithTarget:self action:@selector(handleWheelSelect:)],
 #endif
@@ -446,6 +463,38 @@
                                                                       traceback:nil]);
 }
 
+/**
+ * Inject a drag without waiting for XCTest to confirm it, the way fastTap does for a tap.
+ *
+ * One /wda/dragfromtoforduration call measured 1.73 s for a 0.4 s gesture: the same
+ * confirmation and pre-event quiescence that a tap pays, on a longer gesture.
+ */
++ (id<FBResponsePayload>)handleFastDrag:(FBRouteRequest *)request
+{
+  double fromX = [request.arguments[@"fromX"] doubleValue];
+  double fromY = [request.arguments[@"fromY"] doubleValue];
+  double toX = [request.arguments[@"toX"] doubleValue];
+  double toY = [request.arguments[@"toY"] doubleValue];
+  double duration = [request.arguments[@"duration"] doubleValue];
+  if (!(duration > 0) || duration > 10) {
+    duration = 0.4;
+  }
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    XCPointerEventPath *path = [[XCPointerEventPath alloc] initForTouchAtPoint:CGPointMake(fromX, fromY)
+                                                                       offset:0.0];
+    [path moveToPoint:CGPointMake(toX, toY) atOffset:duration];
+    [path liftUpAtOffset:duration + 0.01];
+    XCSynthesizedEventRecord *record =
+      [[XCSynthesizedEventRecord alloc] initWithName:@"wda-fastDrag" interfaceOrientation:1];
+    [record addPointerEventPath:path];
+    NSError *error = nil;
+    if (![record synthesizeWithError:&error]) {
+      NSLog(@"WDA fastDrag injection failed: %@", error.localizedDescription);
+    }
+  });
+  return FBResponseWithOK();
+}
+
 + (id<FBResponsePayload>)handleDrag:(FBRouteRequest *)request
 {
   XCUIElement *target = [self targetFromRequest:request];
@@ -496,6 +545,40 @@
                                                                        traceback:nil]);
   }
   [target fb_swipeWithDirection:direction velocity:request.arguments[@"velocity"]];
+  return FBResponseWithOK();
+}
+
+/**
+ * Inject a touch without waiting for XCTest to confirm it.
+ *
+ * -[XCUICoordinate tap] goes through -[XCSynthesizedEventRecord synthesizeWithError:],
+ * which blocks on a daemon confirmation whose ceiling is __XCTEventConfirmationTimeout
+ * (30 s, read from XCUIAutomation), and sits underneath XCTest's pre-event quiescence.
+ * Measured end to end, one tap cost 0.62-0.94 s. This builds the same record and hands it
+ * to the daemon with a completion handler, so the reply waits for neither.
+ *
+ * The reply therefore proves dispatch, not capture: callers must treat it as executed but
+ * unconfirmed, and verify the outcome from a frame.
+ */
++ (id<FBResponsePayload>)handleFastTap:(FBRouteRequest *)request
+{
+  double x = [request.arguments[@"x"] doubleValue];
+  double y = [request.arguments[@"y"] doubleValue];
+  // XCTest's own confirmed dispatch, just not on the request thread: the route answers
+  // at once and the injection finishes behind it. Calling the daemon directly from here
+  // was faster still (3-7 ms) but killed the runner within three taps, because that
+  // bypasses the session's event-request bookkeeping.
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    XCPointerEventPath *path = [[XCPointerEventPath alloc] initForTouchAtPoint:CGPointMake(x, y) offset:0.0];
+    [path liftUpAtOffset:0.01];
+    XCSynthesizedEventRecord *record =
+      [[XCSynthesizedEventRecord alloc] initWithName:@"wda-fastTap" interfaceOrientation:1];
+    [record addPointerEventPath:path];
+    NSError *error = nil;
+    if (![record synthesizeWithError:&error]) {
+      NSLog(@"WDA fastTap injection failed: %@", error.localizedDescription);
+    }
+  });
   return FBResponseWithOK();
 }
 
